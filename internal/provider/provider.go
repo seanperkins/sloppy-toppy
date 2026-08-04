@@ -17,10 +17,6 @@ import (
 // whatever it could read rather than failing wholesale: a single unreadable
 // session file should not blank the table.
 type Provider interface {
-	// Name is the short adapter identity used in the agent label,
-	// e.g. "hermes", "claude", "codex".
-	Name() string
-
 	// Poll returns every session this provider can currently see,
 	// including ended ones — filtering is the monitor's job. now is
 	// passed in so all providers in a poll share one clock, which keeps
@@ -62,10 +58,14 @@ type Snapshot struct {
 	SpentTotal float64
 
 	// CostRate is $/hour, derived by diffing SpentTotal between fetches.
+	// It is meaningful only when RateKnown is true.
 	CostRate float64
 
-	// Requests is the request count for the reported period.
-	Requests int64
+	// RateKnown reports whether CostRate was actually measured. A rate needs
+	// two fetches, so a single --once run can never have one — and rendering
+	// that as "$0.00/hr" would be the same lie CostSource exists to prevent
+	// for agents: indistinguishable from genuinely spending nothing.
+	RateKnown bool
 
 	FetchedAt time.Time
 

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -182,6 +183,97 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 	}
 	if got := Truncate("short", 20); got != "short" {
 		t.Fatalf("short string was altered: %q", got)
+	}
+}
+
+// TestSanitizeStripsTerminalControl pins the escape-injection fix. Session
+// titles are user prompts and action descriptions are runtime text, so a
+// monitored agent could otherwise repaint its own row — showing STUCK as
+// ACTIVE, or a $40/hr burn as $0.02 — and OSC 52 reaches the clipboard.
+func TestSanitizeStripsTerminalControl(t *testing.T) {
+	const esc = "\x1b"
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "erase-line CSI plus carriage return (row forgery)",
+			in:   esc + "[2K\rACTIVE-innocent",
+			want: "ACTIVE-innocent",
+		},
+		{
+			name: "OSC 52 clipboard write terminated by BEL",
+			in:   "before" + esc + "]52;c;cHduZWQ=\x07after",
+			want: "beforeafter",
+		},
+		{
+			name: "OSC terminated by ST",
+			in:   "a" + esc + "]0;title" + esc + "\\b",
+			want: "ab",
+		},
+		{
+			name: "SGR colour codes are not left as visible junk",
+			in:   esc + "[1;31mRED" + esc + "[0m",
+			want: "RED",
+		},
+		{
+			// NUL is not whitespace, so it is removed outright; substituting a
+			// space would invent a word break that was never in the data.
+			// Newline and tab do become spaces so words don't run together.
+			name: "non-whitespace controls dropped, whitespace controls become spaces",
+			in:   "a\x00b\nc\td",
+			want: "ab c d",
+		},
+		{
+			name: "unterminated OSC swallows the rest rather than leaking",
+			in:   "keep" + esc + "]52;c;never-ends",
+			want: "keep",
+		},
+		{
+			name: "clean text is untouched",
+			in:   "Refactor the auth middleware",
+			want: "Refactor the auth middleware",
+		},
+		{
+			name: "non-ASCII survives",
+			in:   "日本語のタイトル",
+			want: "日本語のタイトル",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Sanitize(tc.in)
+			if got != tc.want {
+				t.Fatalf("Sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.ContainsRune(got, 0x1b) {
+				t.Fatalf("ESC survived sanitization: %q", got)
+			}
+		})
+	}
+}
+
+// TestTruncateSanitizes checks the chokepoint: every renderer truncates, so
+// sanitizing there means neither UI can bypass it.
+func TestTruncateSanitizes(t *testing.T) {
+	got := Truncate("\x1b[2K\rSPOOFED", 40)
+	if strings.ContainsRune(got, 0x1b) {
+		t.Fatalf("Truncate left an escape sequence in %q", got)
+	}
+	if got != "SPOOFED" {
+		t.Fatalf("Truncate = %q, want SPOOFED", got)
+	}
+}
+
+// TestTruncateWidthCountsVisibleRunesOnly guards the layout: an escape
+// sequence occupies runes but no columns, so measuring before stripping would
+// silently shorten real text.
+func TestTruncateWidthCountsVisibleRunesOnly(t *testing.T) {
+	// 10 visible chars preceded by a 4-rune escape sequence.
+	got := Truncate("\x1b[2KABCDEFGHIJ", 10)
+	if got != "ABCDEFGHIJ" {
+		t.Fatalf("Truncate = %q, want the full 10 visible chars", got)
 	}
 }
 

@@ -80,9 +80,12 @@ func RenderSpend(snaps []*provider.Snapshot) string {
 		if s.HasCredits {
 			parts = append(parts, "$"+agent.FmtUSD(s.CreditsRemaining)+" left")
 		}
-		parts = append(parts, "$"+agent.FmtCostRate(s.CostRate)+"/hr")
-		if s.Requests > 0 {
-			parts = append(parts, fmt.Sprintf("%d req", s.Requests))
+		// A rate needs two fetches; one --once run cannot have one, and
+		// printing $0.00 there is indistinguishable from spending nothing.
+		if s.RateKnown {
+			parts = append(parts, "$"+agent.FmtCostRate(s.CostRate)+"/hr")
+		} else {
+			parts = append(parts, "$?/hr (needs a second poll)")
 		}
 		lines = append(lines, strings.Join(parts, " "))
 	}
@@ -109,6 +112,8 @@ type AgentJSON struct {
 	CostUSD    float64 `json:"cost_usd"`
 	CostSource string  `json:"cost_source"`
 	UptimeSecs float64 `json:"uptime_seconds"`
+	EndReason  string  `json:"end_reason,omitempty"`
+	Incomplete bool    `json:"incomplete,omitempty"`
 	LastTool   string  `json:"last_tool"`
 	LastAction string  `json:"last_action"`
 	CWD        string  `json:"cwd,omitempty"`
@@ -122,13 +127,17 @@ type AgentJSON struct {
 // figure from an estimate from a total unknown — a zero cost_usd with
 // cost_source "" means "we don't know", not "free".
 func ToJSON(a *agent.Agent, now time.Time) AgentJSON {
+	// Provider-derived strings are sanitized here too, not just in the table.
+	// encoding/json escapes control bytes on the wire, so a JSON *parser* is
+	// safe either way — but the decoded value would still carry a live escape
+	// sequence, and `jq -r .title` prints it straight to a terminal.
 	return AgentJSON{
 		Agent:      a.Label(),
 		Provider:   a.Provider,
 		Instance:   a.Instance,
 		SessionID:  a.SessionID,
 		Origin:     a.Origin,
-		Title:      a.Title,
+		Title:      agent.Sanitize(a.Title),
 		Model:      a.Model,
 		State:      string(a.State),
 		IdleSecs:   round(a.IdleSeconds, 1),
@@ -141,10 +150,12 @@ func ToJSON(a *agent.Agent, now time.Time) AgentJSON {
 		CostUSD:    round(a.CostUSD, 6),
 		CostSource: string(a.CostSource),
 		UptimeSecs: round(a.Uptime(now).Seconds(), 1),
-		LastTool:   a.LastTool,
-		LastAction: a.LastActionDesc,
-		CWD:        a.CWD,
-		GitBranch:  a.GitBranch,
+		EndReason:  a.EndReason,
+		Incomplete: a.Incomplete,
+		LastTool:   agent.Sanitize(a.LastTool),
+		LastAction: agent.Sanitize(a.LastActionDesc),
+		CWD:        agent.Sanitize(a.CWD),
+		GitBranch:  agent.Sanitize(a.GitBranch),
 		OwnerPID:   a.OwnerPID,
 	}
 }

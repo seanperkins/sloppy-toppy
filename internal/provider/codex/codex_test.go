@@ -101,16 +101,87 @@ func TestParsesRollout(t *testing.T) {
 		t.Fatalf("ctx used = %d, want %d", a.CtxUsed, want)
 	}
 
-	// Cumulative input already includes the cached portion; the fields must
-	// not double-count it.
+	// Codex reports two overlapping breakdowns; both must be removed so the
+	// Agent's fields are disjoint and nothing is billed twice.
 	if want := int64(466913 - 398336); a.InputTokens != want {
 		t.Fatalf("input tokens = %d, want %d (cached portion removed)", a.InputTokens, want)
 	}
 	if a.CacheReadTokens != 398336 {
 		t.Fatalf("cache read = %d, want 398336", a.CacheReadTokens)
 	}
+	// This is the assertion that previously pinned the bug in place: it
+	// checked reasoning alone while output still carried the same tokens.
+	if want := int64(5605 - 3777); a.OutputTokens != want {
+		t.Fatalf("output tokens = %d, want %d (reasoning is a component of "+
+			"output, not a sibling — counting both double-bills it)",
+			a.OutputTokens, want)
+	}
 	if a.ReasoningTokens != 3777 {
-		t.Fatalf("reasoning = %d, want 3777", a.ReasoningTokens)
+		t.Fatalf("reasoning = %d, want 3777 (kept as a display breakdown)", a.ReasoningTokens)
+	}
+
+	// The whole subtraction rests on this identity, so assert it directly.
+	if got := a.InputTokens + a.CacheReadTokens + a.OutputTokens + a.ReasoningTokens; got != 472518 {
+		t.Fatalf("disjoint fields sum to %d, want total_tokens 472518", got)
+	}
+}
+
+// TestBurnExcludesDoubleCountedReasoning guards the number actually shown on
+// screen: BurnTokens sums input+output+reasoning, so if reasoning were left
+// inside output it would be counted twice in TOK/s and in cost.
+func TestBurnExcludesDoubleCountedReasoning(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 10, 10, 0, 0, time.UTC)
+	base := writeRollout(t, []string{sessionMetaLine, turnContextLine, tokenCountLine}, now)
+
+	agents, _ := New(base).Poll(context.Background(), now)
+	a := agents[0]
+
+	// input(68577) + output(1828) + reasoning(3777) = 74182.
+	// With the bug it was 68577 + 5605 + 3777 = 77959, +5.1%.
+	const want = int64(68577 + 1828 + 3777)
+	if got := a.BurnTokens(); got != want {
+		t.Fatalf("burn = %d, want %d — reasoning is being counted twice", got, want)
+	}
+}
+
+// TestComponentsAgreeGuardsTheInvariant checks the cross-check that would have
+// caught the double-count: TotalTokens was decoded and never read.
+func TestComponentsAgreeGuardsTheInvariant(t *testing.T) {
+	ok := &codexUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120}
+	if !ok.componentsAgree() {
+		t.Fatal("input+output == total was reported as disagreeing")
+	}
+	// If a future payload made reasoning additive, total would no longer match.
+	bad := &codexUsage{InputTokens: 100, OutputTokens: 20, ReasoningOutput: 5, TotalTokens: 125}
+	if bad.componentsAgree() {
+		t.Fatal("a payload where reasoning is additive was accepted as consistent")
+	}
+	// Absent total: nothing to check against, so do not cry wolf.
+	if !(&codexUsage{InputTokens: 1}).componentsAgree() {
+		t.Fatal("a payload with no total_tokens was reported as inconsistent")
+	}
+}
+
+// TestUnattendedRolloutNotInferredEnded mirrors the Claude Code case: a quiet
+// unattended session must stay live so it can classify STUCK.
+func TestUnattendedRolloutNotInferredEnded(t *testing.T) {
+	written := time.Date(2026, time.August, 4, 10, 5, 0, 0, time.UTC)
+	// originator acpx with no interactive source -> unattended.
+	meta := `{"timestamp":"2026-08-04T10:00:00.000Z","type":"session_meta","payload":{` +
+		`"id":"019f-zzz","session_id":"019f-zzz","cwd":"/Users/x/sites/demo-project",` +
+		`"originator":"acpx","cli_version":"0.145.0","git":{"branch":"main"}}}`
+	base := writeRollout(t, []string{meta, turnContextLine, tokenCountLine}, written)
+
+	agents, _ := New(base).Poll(context.Background(), written.Add(6*time.Hour))
+	if len(agents) != 1 {
+		t.Fatalf("got %d agents, want 1", len(agents))
+	}
+	if agents[0].IsInteractive() {
+		t.Fatalf("origin %q counted as interactive", agents[0].Origin)
+	}
+	if !agents[0].EndedAt.IsZero() {
+		t.Fatal("an unattended quiet rollout was inferred as ended, hiding a " +
+			"potentially wedged agent")
 	}
 }
 

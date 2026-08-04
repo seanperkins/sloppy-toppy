@@ -37,6 +37,10 @@ func Run(o Options) error {
 		sort:    o.Sort,
 		refresh: o.Refresh,
 		version: o.Version,
+		// Seed from the monitor, or `sloppy-toppy -a` starts showing ended
+		// sessions while the model believes it is not, so the first press of
+		// `a` turns them on again instead of off.
+		showEnded: o.Monitor.Config().ShowEnded,
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
@@ -93,7 +97,12 @@ type model struct {
 	errs   []error
 	now    time.Time
 
-	cursor     int
+	cursor int
+	// offset is the index of the first drawn row. Without it the view always
+	// started at 0 while the cursor could reach the end of the slice, so on
+	// any list longer than the viewport the highlight simply vanished and the
+	// detail pane described a row that was never on screen.
+	offset     int
 	showDetail bool
 	showEnded  bool
 	width      int
@@ -102,7 +111,35 @@ type model struct {
 }
 
 func (m *model) Init() tea.Cmd {
+	// Mark the first poll in flight before it starts. Otherwise a poll slower
+	// than the refresh interval lets the first tick launch a second one, and
+	// two concurrent sweeps can land out of order — the older snapshot
+	// overwriting the newer, and a spend source being billed twice.
+	m.loading = true
 	return tea.Batch(m.poll(), tick(m.refresh))
+}
+
+// clampScroll keeps the cursor inside the drawn region.
+func (m *model) clampScroll() {
+	rows := m.visibleRows()
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(m.agents) {
+		m.cursor = maxInt(0, len(m.agents)-1)
+	}
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	}
+	if m.cursor >= m.offset+rows {
+		m.offset = m.cursor - rows + 1
+	}
+	if max := len(m.agents) - rows; m.offset > max {
+		m.offset = maxInt(0, max)
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
 }
 
 func tick(d time.Duration) tea.Cmd {
@@ -128,6 +165,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		// A resize changes how many rows fit, so the window may need moving.
+		m.clampScroll()
 		return m, nil
 
 	case tickMsg:
@@ -147,10 +186,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		agent.Sort(msg.agents, m.sort)
 		m.preserveCursor(msg.agents)
 		m.agents = msg.agents
+		m.clampScroll()
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		model, cmd := m.handleKey(msg)
+		m.clampScroll()
+		return model, cmd
 	}
 	return m, nil
 }
@@ -244,12 +286,17 @@ func (m *model) View() string {
 		b.WriteString(footerStyle.Render("  no live agent sessions found"))
 		b.WriteString("\n")
 	}
-	for i := 0; i < rows && i < len(m.agents); i++ {
+	// Draw the window starting at offset, not always at 0.
+	for i := m.offset; i < m.offset+rows && i < len(m.agents); i++ {
 		line := m.row(m.agents[i])
 		if i == m.cursor {
 			line = selectedRow.Render(m.pad(line))
 		}
 		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	if hidden := len(m.agents) - (m.offset + rows); hidden > 0 {
+		b.WriteString(footerStyle.Render(fmt.Sprintf("  … %d more below", hidden)))
 		b.WriteString("\n")
 	}
 
@@ -275,9 +322,12 @@ func (m *model) visibleRows() int {
 	if m.height <= 0 {
 		return len(m.agents)
 	}
-	chrome := 5 // header, summary, column header, footer, breathing room
+	chrome := 6 // header, summary, column header, footer, scroll hint, slack
 	if m.showDetail {
 		chrome += 8
+	}
+	if len(m.spends) > 0 {
+		chrome++ // the spend strip takes a line when a source is configured
 	}
 	if len(m.errs) > 0 {
 		chrome += len(m.errs)
@@ -346,11 +396,88 @@ func (m *model) spendLine() string {
 	return strings.Join(parts, "   ")
 }
 
-const rowFormat = "%-16s%-24s%7s%8s%8s %-7s%-12s%8s  %s"
+// Column widths. The row is assembled in two pieces so the STATE cell can be
+// colourised without lipgloss escape codes being counted as width, which means
+// the layout is encoded in more than one place — these constants are that one
+// place, and everything else derives from them.
+//
+// Previously the title budget was a hardcoded 84 while the real fixed width was
+// 93, so every row ran 9 columns over the terminal and wrapped. On an 80-column
+// terminal even the header wrapped before a single agent was drawn.
+const (
+	colAgent  = 16
+	colModel  = 24
+	colTok    = 7
+	colCtx    = 8
+	colCost   = 8
+	colState  = 7
+	colTool   = 12
+	colUptime = 8
+
+	// Two literal spaces separate cost from state and uptime from title.
+	colSeparators = 1 + 2
+
+	// fixedWidth is every column before TITLE, including separators.
+	fixedWidth = colAgent + colModel + colTok + colCtx + colCost +
+		colState + colTool + colUptime + colSeparators
+
+	// minTitleWidth keeps the title column usable on a very narrow terminal
+	// even though the row will then overflow — there is nothing else to give.
+	minTitleWidth = 10
+)
+
+// Compact layout, used when the full one cannot fit. An 80-column terminal is
+// entirely normal, and the full layout needs 93 columns before the title even
+// starts — so rather than overflow and wrap (which breaks the whole viewport),
+// narrow terminals drop TOOL and UPTIME and tighten AGENT and MODEL.
+const (
+	compactAgent = 14
+	compactModel = 14
+
+	compactFixed = compactAgent + compactModel + colTok + colCtx + colCost +
+		colState + colSeparators
+)
+
+// layout is the set of column widths in use at the current terminal width.
+type layout struct {
+	agent, model int
+	showTool     bool
+	showUptime   bool
+	fixed        int
+	title        int
+}
+
+// layoutFor picks the widest layout that fits, so a row never wraps.
+func (m *model) layoutFor() layout {
+	// An unknown terminal size (before the first WindowSizeMsg) gets the full
+	// layout with a sane fixed title budget.
+	if m.width <= 0 {
+		return layout{agent: colAgent, model: colModel, showTool: true,
+			showUptime: true, fixed: fixedWidth, title: 48}
+	}
+	if m.width >= fixedWidth+minTitleWidth {
+		return layout{agent: colAgent, model: colModel, showTool: true,
+			showUptime: true, fixed: fixedWidth, title: m.width - fixedWidth}
+	}
+	return layout{
+		agent: compactAgent, model: compactModel,
+		fixed: compactFixed,
+		title: maxInt(minTitleWidth, m.width-compactFixed),
+	}
+}
 
 func (m *model) columnHeader() string {
-	return fmt.Sprintf(rowFormat,
-		"AGENT", "MODEL", "TOK/s", "CTX%", "$/HR", "STATE", "TOOL", "UPTIME", "TITLE")
+	l := m.layoutFor()
+	head := fmt.Sprintf("%-*s%-*s%*s%*s%*s %-*s",
+		l.agent, "AGENT", l.model, "MODEL", colTok, "TOK/s",
+		colCtx, "CTX%", colCost, "$/HR", colState, "STATE")
+	if l.showTool {
+		head += fmt.Sprintf("%-*s", colTool, "TOOL")
+	}
+	if l.showUptime {
+		head += fmt.Sprintf("%*s", colUptime, "UPTIME")
+	}
+	return head + "  " + "TITLE"
 }
 
 func (m *model) row(a *agent.Agent) string {
@@ -358,27 +485,36 @@ func (m *model) row(a *agent.Agent) string {
 	if tool == "" {
 		tool = "—"
 	}
-	title := a.Title
+	// Fall back only after sanitizing: a title made entirely of control
+	// characters is empty once stripped, and a blank row is less useful than
+	// the session id.
+	title := agent.Sanitize(a.Title)
 	if title == "" {
 		title = a.SessionID
 	}
-	state := stateStyles[a.State].Render(fmt.Sprintf("%-7s", string(a.State)))
+	l := m.layoutFor()
+	state := stateStyles[a.State].Render(fmt.Sprintf("%-*s", colState, string(a.State)))
 
 	// State is styled, so it is formatted separately from the rest of the
 	// row: lipgloss escape codes would otherwise be counted as width.
-	left := fmt.Sprintf("%-16s%-24s%7s%8s%8s ",
-		agent.Truncate(a.Label(), 16),
-		agent.Truncate(a.ShortModel(), 24),
-		agent.FmtRate(a.TokRate),
-		ctxCell(a),
-		costCell(a),
+	left := fmt.Sprintf("%-*s%-*s%*s%*s%*s ",
+		l.agent, agent.Truncate(a.Label(), l.agent),
+		l.model, agent.Truncate(a.ShortModel(), l.model),
+		colTok, agent.FmtRate(a.TokRate),
+		colCtx, ctxCell(a),
+		colCost, costCell(a),
 	)
-	right := fmt.Sprintf("%-12s%8s  %s",
-		agent.Truncate(tool, 12),
-		agent.FmtUptime(a.Uptime(m.now)),
-		agent.Truncate(title, maxInt(10, m.width-84)),
-	)
-	return left + state + right
+
+	var right strings.Builder
+	if l.showTool {
+		fmt.Fprintf(&right, "%-*s", colTool, agent.Truncate(tool, colTool))
+	}
+	if l.showUptime {
+		fmt.Fprintf(&right, "%*s", colUptime, agent.FmtUptime(a.Uptime(m.now)))
+	}
+	fmt.Fprintf(&right, "  %s", agent.Truncate(title, l.title))
+
+	return left + state + right.String()
 }
 
 // ctxCell marks an approximated context figure with a leading ~, so a

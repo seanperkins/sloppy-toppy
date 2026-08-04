@@ -17,10 +17,9 @@ import (
 // values the shipped binary uses — previously the Monitor and the CLI
 // disagreed about ActiveIdle and nothing caught it.
 const (
-	DefaultActiveIdle  = 60 * time.Second
-	DefaultStuckIdle   = 240 * time.Second
-	DefaultRefresh     = 2 * time.Second
-	DefaultSpendPeriod = 60 * time.Second
+	DefaultActiveIdle = 60 * time.Second
+	DefaultStuckIdle  = 240 * time.Second
+	DefaultRefresh    = 2 * time.Second
 
 	// emaAlpha weights the newest sample in the rate EMA. Lower values
 	// smooth harder; 0.3 tracks bursts without flickering.
@@ -71,6 +70,9 @@ type Monitor struct {
 	spendCache  map[string]*provider.Snapshot
 	spendPolled map[string]time.Time
 	spendPrev   map[string]float64
+	// spendPrevAt is when spendPrev was recorded — the last *successful*
+	// fetch, which is the correct denominator for the spend delta.
+	spendPrevAt map[string]time.Time
 }
 
 // New builds a Monitor over the given providers.
@@ -83,11 +85,16 @@ func New(cfg Config, providers []provider.Provider, spends []provider.Spend) *Mo
 		spendCache:  map[string]*provider.Snapshot{},
 		spendPolled: map[string]time.Time{},
 		spendPrev:   map[string]float64{},
+		spendPrevAt: map[string]time.Time{},
 	}
 }
 
 // Config returns the effective configuration.
 func (m *Monitor) Config() Config { return m.cfg }
+
+// ProviderCount is how many providers are configured, so a caller can tell a
+// partial failure from a total one.
+func (m *Monitor) ProviderCount() int { return len(m.providers) }
 
 // SetShowEnded toggles inclusion of finished sessions.
 func (m *Monitor) SetShowEnded(v bool) {
@@ -232,6 +239,11 @@ func max0(v float64) float64 {
 func (m *Monitor) Classify(a *agent.Agent, now time.Time) {
 	if !a.EndedAt.IsZero() {
 		a.State = agent.StateDone
+		// Measure idle from the end, so a session that finished six hours ago
+		// does not report idle_seconds: 0 as though it just stopped.
+		if idle := now.Sub(a.EndedAt); idle > 0 {
+			a.IdleSeconds = idle.Seconds()
+		}
 		return
 	}
 	if a.LastActivityAt.IsZero() {
@@ -310,14 +322,24 @@ func (m *Monitor) SpendSnapshots(ctx context.Context, now time.Time) []*provider
 				delete(m.spendCache, s.Name())
 				continue
 			}
-			// Derive $/hr by diffing total spend between fetches.
+			// Derive $/hr by diffing total spend between successful fetches.
+			//
+			// The elapsed time must span the same interval as the spend delta.
+			// Measuring it from the last *attempt* while the delta spans the
+			// last *success* overstates the rate by (k+1)x after k failures —
+			// and a transient 429 from a rate-limited billing endpoint is the
+			// normal case, not an edge case.
 			if prev, ok := m.spendPrev[s.Name()]; ok && snap.Err == nil {
-				if elapsed := now.Sub(m.spendLast(s.Name())).Hours(); elapsed > 0 {
-					snap.CostRate = max0(snap.SpentTotal-prev) / elapsed
+				if since, ok := m.spendPrevAt[s.Name()]; ok {
+					if elapsed := now.Sub(since).Hours(); elapsed > 0 {
+						snap.CostRate = max0(snap.SpentTotal-prev) / elapsed
+						snap.RateKnown = true
+					}
 				}
 			}
 			if snap.Err == nil {
 				m.spendPrev[s.Name()] = snap.SpentTotal
+				m.spendPrevAt[s.Name()] = now
 			}
 			m.spendCache[s.Name()] = snap
 		}
@@ -333,12 +355,4 @@ func (m *Monitor) SpendSnapshots(ctx context.Context, now time.Time) []*provider
 		}
 	}
 	return out
-}
-
-// spendLast returns when a source was previously fetched; callers hold m.mu.
-func (m *Monitor) spendLast(name string) time.Time {
-	if snap, ok := m.spendCache[name]; ok {
-		return snap.FetchedAt
-	}
-	return time.Time{}
 }

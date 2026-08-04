@@ -23,14 +23,28 @@ hermes:default    deepseek-v4-flash-0731       2.6   ~4.4%    0.00 IDLE   web_se
 
 ## Install
 
-Single static binary, no runtime required:
+Single static binary, no runtime required. This downloads to a temp file and
+verifies it against the release checksums before installing — piping an
+unverified download straight into `/usr/local/bin` is not a good trade for one
+saved line:
 
 ```sh
-curl -sSL https://github.com/seanperkins/sloppy-toppy/releases/latest/download/sloppy-toppy_$(uname -s)_$(uname -m).tar.gz \
-  | tar -xz -C /usr/local/bin sloppy-toppy
+REPO=seanperkins/sloppy-toppy
+ASSET="sloppy-toppy_$(uname -s)_$(uname -m).tar.gz"
+BASE="https://github.com/$REPO/releases/latest/download"
+
+tmp=$(mktemp -d) && cd "$tmp" &&
+curl -fsSL -O "$BASE/$ASSET" &&
+curl -fsSL -O "$BASE/checksums.txt" &&
+shasum -a 256 --ignore-missing -c checksums.txt &&
+tar -xzf "$ASSET" sloppy-toppy &&
+sudo install -m 0755 sloppy-toppy /usr/local/bin/sloppy-toppy
 ```
 
-Or build from source (Go 1.24+):
+`curl -f` matters: without it a 404 writes GitHub's error page to the file and
+exits 0, handing the failure to `tar` instead of reporting it.
+
+Or build from source (Go 1.26+, matching `go.mod`):
 
 ```sh
 go install github.com/seanperkins/sloppy-toppy/cmd/sloppy-toppy@latest
@@ -101,12 +115,29 @@ than reporting a permanent error.
   `source`) — so a profile *named* "slack" that runs cron jobs is still
   eligible for STUCK.
 
-- **Finished sessions are inferred where a runtime doesn't mark them.**
-  Claude Code and Codex write no end marker, so a completed run and a wedged
-  one look identical on disk. A transcript quiet for over an hour
-  (`--assume-ended-after`) is treated as finished, with `end_reason` recording
-  that the end was inferred rather than observed. Without this, every finished
-  run accumulates as STUCK forever and buries the one you actually want.
+- **A finished session is only inferred where that's safe.** Claude Code and
+  Codex write no end marker — there is no terminal stop record — so silence
+  cannot distinguish a completed run from a wedged one. The inference is
+  therefore applied only to sessions a human was driving: those go quiet
+  because someone walked away, and hiding them keeps the table readable
+  (`--assume-ended-after`, `end_reason` records that the end was inferred).
+
+  Unattended sessions are deliberately excluded. Calling one DONE on nothing
+  but silence would retire exactly the alert this tool exists to raise, so they
+  stay live and classify STUCK. Bound how far back they're considered with
+  `--lookback` rather than by guessing that quiet means finished.
+
+- **Counters are never silently partial.** A transcript line too large to read
+  is skipped rather than ending the scan, and the session is flagged
+  `incomplete` in `--json`. Stopping at that line — what an unchecked
+  `bufio.Scanner` does — would freeze a session's reported spend for the rest
+  of its life while still looking authoritative.
+
+- **Provider-supplied text is sanitized before it reaches your terminal.**
+  Titles are user prompts and action descriptions are runtime text, so they can
+  carry ANSI escapes. Rendered raw, a monitored agent could repaint its own row
+  — showing STUCK as ACTIVE, or a $40/hr burn as $0.02 — and OSC 52 would write
+  your clipboard. Control sequences are stripped at the render boundary.
 
 - **Polling is proportional to live work, not to accumulated history.**
   File-based runtimes are filtered on modification time before anything is

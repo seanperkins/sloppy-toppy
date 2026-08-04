@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/seanperkins/sloppy-toppy/internal/agent"
+	"github.com/seanperkins/sloppy-toppy/internal/jsonl"
 	"github.com/seanperkins/sloppy-toppy/internal/pricing"
 )
 
@@ -31,9 +34,13 @@ const DefaultBase = "~/.codex"
 // rather than to accumulated history.
 const DefaultLookback = 12 * time.Hour
 
-// DefaultAssumeEndedAfter is how long a rollout may sit untouched before the
-// session is treated as finished. Like Claude Code, Codex writes no end
-// marker, so without this a completed run stays visible as STUCK forever.
+// DefaultAssumeEndedAfter is how long an *interactive* rollout may sit
+// untouched before the session is treated as finished.
+//
+// Like Claude Code, Codex writes no end marker, so silence cannot distinguish
+// a finished run from a wedged one. The inference is applied only to sessions a
+// human was driving; an unattended one stays live so it can classify STUCK
+// rather than being quietly retired as DONE.
 const DefaultAssumeEndedAfter = time.Hour
 
 // Provider polls Codex rollouts.
@@ -54,9 +61,6 @@ func New(base string) *Provider {
 		AssumeEndedAfter: DefaultAssumeEndedAfter,
 	}
 }
-
-// Name implements provider.Provider.
-func (p *Provider) Name() string { return "codex" }
 
 type rolloutRecord struct {
 	Type      string          `json:"type"`
@@ -105,12 +109,34 @@ type tokenCount struct {
 }
 
 type codexUsage struct {
-	InputTokens      int64 `json:"input_tokens"`
-	CachedInput      int64 `json:"cached_input_tokens"`
-	CacheWriteInput  int64 `json:"cache_write_input_tokens"`
-	OutputTokens     int64 `json:"output_tokens"`
-	ReasoningOutput  int64 `json:"reasoning_output_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	InputTokens     int64 `json:"input_tokens"`
+	CachedInput     int64 `json:"cached_input_tokens"`
+	CacheWriteInput int64 `json:"cache_write_input_tokens"`
+	OutputTokens    int64 `json:"output_tokens"`
+	ReasoningOutput int64 `json:"reasoning_output_tokens"`
+	TotalTokens     int64 `json:"total_tokens"`
+}
+
+// componentsAgree reports whether input + output accounts for the reported
+// total, which is what establishes that cached input and reasoning output are
+// breakdowns *within* those two figures rather than additional tokens.
+//
+// This is the invariant the adapter's arithmetic depends on. It held on the
+// fixture and on every live rollout checked, but a provider-side change would
+// silently resume the double-billing it exists to prevent — so a violation
+// marks the reading incomplete rather than being ignored.
+func (u *codexUsage) componentsAgree() bool {
+	if u.TotalTokens == 0 {
+		return true // nothing reported to cross-check against
+	}
+	return u.InputTokens+u.OutputTokens == u.TotalTokens
+}
+
+func clampNonNegative(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // turnContext carries the model in use for the turn.
@@ -126,26 +152,9 @@ type eventPayload struct {
 	Message string `json:"message"`
 }
 
-func expandHome(path string) string {
-	if !strings.HasPrefix(path, "~") {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	if path == "~" {
-		return home
-	}
-	if strings.HasPrefix(path, "~/") {
-		return filepath.Join(home, path[2:])
-	}
-	return path
-}
-
 // Poll implements provider.Provider.
 func (p *Provider) Poll(ctx context.Context, now time.Time) ([]*agent.Agent, error) {
-	root := filepath.Join(expandHome(p.Base), "sessions")
+	root := filepath.Join(jsonl.ExpandHome(p.Base), "sessions")
 	lookback := p.Lookback
 	if lookback <= 0 {
 		lookback = DefaultLookback
@@ -208,16 +217,32 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 		sawAny     bool
 	)
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 256*1024), 16*1024*1024)
-
-	for sc.Scan() {
-		line := sc.Bytes()
+	rd := bufio.NewReaderSize(f, jsonl.ReaderBufBytes)
+	for {
+		line, truncated, readErr := jsonl.ReadLine(rd, jsonl.MaxLineBytes)
+		if truncated {
+			// Skip the oversized line rather than ending the scan. An
+			// unchecked bufio.Scanner would stop here and report the partial
+			// session as authoritative — silently capping reported burn.
+			a.Incomplete = true
+		}
+		if readErr != nil && len(line) == 0 {
+			if !errors.Is(readErr, io.EOF) {
+				a.Incomplete = true
+			}
+			break
+		}
 		if len(line) == 0 {
+			if readErr != nil {
+				break
+			}
 			continue
 		}
 		var r rolloutRecord
 		if err := json.Unmarshal(line, &r); err != nil {
+			if readErr != nil {
+				break
+			}
 			continue
 		}
 		sawAny = true
@@ -292,7 +317,7 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 			case "user_message":
 				var ev eventPayload
 				if json.Unmarshal(r.Payload, &ev) == nil && a.Title == "" && ev.Message != "" {
-					a.Title = firstLine(ev.Message)
+					a.Title = jsonl.FirstLine(ev.Message)
 				}
 			}
 		}
@@ -312,20 +337,34 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 	}
 
 	if lastTotals != nil {
-		// Codex's cumulative `input_tokens` already includes the cached
-		// portion, so subtract it out to keep the fields non-overlapping.
-		a.InputTokens = lastTotals.InputTokens - lastTotals.CachedInput
-		if a.InputTokens < 0 {
-			a.InputTokens = 0
-		}
+		// Codex reports two overlapping breakdowns, and both must be removed
+		// to keep these fields disjoint:
+		//
+		//   input_tokens  already includes cached_input_tokens
+		//   output_tokens already includes reasoning_output_tokens
+		//
+		// The payload proves it: total_tokens == input_tokens + output_tokens
+		// exactly, with reasoning excluded from that sum (asserted in the
+		// tests). Counting reasoning as a sibling of output rather than a
+		// component of it double-bills it — at the output rate, since no
+		// shipped model sets a separate reasoning rate — which for a
+		// high-effort reasoning model is most of the output line.
+		a.InputTokens = clampNonNegative(lastTotals.InputTokens - lastTotals.CachedInput)
 		a.CacheReadTokens = lastTotals.CachedInput
 		a.CacheWriteTokens = lastTotals.CacheWriteInput
-		a.OutputTokens = lastTotals.OutputTokens
+		a.OutputTokens = clampNonNegative(lastTotals.OutputTokens - lastTotals.ReasoningOutput)
 		a.ReasoningTokens = lastTotals.ReasoningOutput
+
+		if !lastTotals.componentsAgree() {
+			// The overlap assumption above no longer holds, so these totals
+			// cannot be trusted to be non-overlapping.
+			a.Incomplete = true
+		}
 	}
 
 	// The last call's own usage is the live prefix size — a real measurement
-	// of context fill rather than a running total.
+	// of context fill rather than a running total. Reasoning is inside output
+	// here too, so the sum needs no separate reasoning term.
 	if lastCall != nil {
 		a.CtxUsed = lastCall.InputTokens + lastCall.CacheWriteInput + lastCall.OutputTokens
 		a.CtxAccurate = true
@@ -350,7 +389,8 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 	if assumeEnded <= 0 {
 		assumeEnded = DefaultAssumeEndedAfter
 	}
-	if now.Sub(a.LastActivityAt) > assumeEnded {
+	// Only interactive sessions get an inferred end; see the constant's doc.
+	if a.IsInteractive() && now.Sub(a.LastActivityAt) > assumeEnded {
 		a.EndedAt = a.LastActivityAt
 		a.EndReason = "inferred: no rollout activity"
 	}
@@ -385,11 +425,4 @@ func parseTime(s string) time.Time {
 		}
 	}
 	return time.Time{}
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
 }

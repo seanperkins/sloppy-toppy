@@ -17,6 +17,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/seanperkins/sloppy-toppy/internal/agent"
+	"github.com/seanperkins/sloppy-toppy/internal/jsonl"
 	"github.com/seanperkins/sloppy-toppy/internal/pricing"
 )
 
@@ -40,15 +43,20 @@ const DefaultBase = "~/.claude"
 // a full scan to a handful of stat calls.
 const DefaultLookback = 12 * time.Hour
 
-// DefaultAssumeEndedAfter is how long a transcript may sit untouched before
-// the session is treated as finished.
+// DefaultAssumeEndedAfter is how long an *interactive* transcript may sit
+// untouched before the session is treated as finished.
 //
-// Claude Code writes no end marker, so a completed run and a wedged one look
-// identical on disk — the only difference is how long ago the last record
-// was written. Without this inference every finished session accumulates as
-// STUCK forever, and the genuinely wedged agent you want to catch is buried
-// under hours of history. An hour is well past any single API call, so a
-// transcript quiet that long has stopped rather than stalled.
+// Claude Code writes no end marker — there is no terminal stop record, and the
+// last line of a finished transcript is ordinary metadata — so a completed run
+// and a wedged one are indistinguishable from file content alone. The
+// inference is therefore applied only where it is safe: a human-driven session
+// goes quiet because someone walked away, and hiding it keeps the table
+// readable.
+//
+// Unattended sessions are deliberately excluded. Marking one DONE on nothing
+// but silence would retire the exact alert this tool exists to raise; they stay
+// live and classify STUCK instead. Bound how far back they are considered with
+// --lookback rather than by guessing that quiet means finished.
 const DefaultAssumeEndedAfter = time.Hour
 
 // Provider polls Claude Code transcripts.
@@ -71,15 +79,13 @@ func New(base string) *Provider {
 	}
 }
 
-// Name implements provider.Provider.
-func (p *Provider) Name() string { return "claude" }
-
 // record is the subset of a transcript line this adapter reads. Claude Code
 // writes many record types; everything not named here is ignored.
 type record struct {
 	Type       string          `json:"type"`
 	Timestamp  string          `json:"timestamp"`
 	SessionID  string          `json:"sessionId"`
+	RequestID  string          `json:"requestId"`
 	CWD        string          `json:"cwd"`
 	GitBranch  string          `json:"gitBranch"`
 	Entrypoint string          `json:"entrypoint"`
@@ -96,10 +102,19 @@ type originField struct {
 }
 
 type messageField struct {
+	// ID together with the record's requestId identifies one API call.
+	// Claude Code emits one line per content block and repeats the same
+	// usage object on each, so this pair is what makes usage summable.
+	ID      string          `json:"id"`
 	Model   string          `json:"model"`
 	Usage   *usageField     `json:"usage"`
 	Content json.RawMessage `json:"content"`
 }
+
+// syntheticModel marks records Claude Code generates itself rather than
+// receiving from the API. They carry zero usage but would otherwise win the
+// "last model seen" race and leave the session unpriced.
+const syntheticModel = "<synthetic>"
 
 // usageField mirrors the Anthropic usage object. Cache creation is reported
 // both as a flat total and as a per-TTL breakdown; the flat field is used.
@@ -116,26 +131,9 @@ func (u *usageField) prefixTokens() int64 {
 	return u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
 }
 
-func expandHome(path string) string {
-	if !strings.HasPrefix(path, "~") {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	if path == "~" {
-		return home
-	}
-	if strings.HasPrefix(path, "~/") {
-		return filepath.Join(home, path[2:])
-	}
-	return path
-}
-
 // Poll implements provider.Provider.
 func (p *Provider) Poll(ctx context.Context, now time.Time) ([]*agent.Agent, error) {
-	root := filepath.Join(expandHome(p.Base), "projects")
+	root := filepath.Join(jsonl.ExpandHome(p.Base), "projects")
 	lookback := p.Lookback
 	if lookback <= 0 {
 		lookback = DefaultLookback
@@ -192,73 +190,43 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 
 	a := &agent.Agent{
 		Provider:  "claude",
-		Instance:  projectLabel(filepath.Dir(path)),
 		SessionID: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 	}
 
 	var (
-		total    usageField
-		lastCall *usageField
-		calls    int64
-		tools    int64
-		sawAny   bool
+		perModel  = map[string]*usageField{} // usage summed per model, for pricing
+		seenCalls = map[string]bool{}        // dedupe key -> already counted
+		seenTools = map[string]bool{}
+		lastCall  *usageField
+		calls     int64
+		tools     int64
+		sawAny    bool
 	)
 
-	sc := bufio.NewScanner(f)
-	// Transcript lines carry whole tool results and can be very large; the
-	// default 64 KB scanner limit would silently truncate them mid-session.
-	sc.Buffer(make([]byte, 0, 256*1024), 16*1024*1024)
-
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+	rd := bufio.NewReaderSize(f, jsonl.ReaderBufBytes)
+	for {
+		line, truncated, err := jsonl.ReadLine(rd, jsonl.MaxLineBytes)
+		if truncated {
+			// An oversized line is skipped, not fatal. Ending the scan here
+			// (which is what an unchecked bufio.Scanner does) would freeze the
+			// session's reported spend at its pre-truncation value forever,
+			// with no error anywhere — a monitoring bypass.
+			a.Incomplete = true
 		}
-		var r record
-		if err := json.Unmarshal(line, &r); err != nil {
-			continue // a partially-written trailing line is normal on a live session
-		}
-		sawAny = true
-
-		if ts := parseTime(r.Timestamp); !ts.IsZero() {
-			if a.StartedAt.IsZero() || ts.Before(a.StartedAt) {
-				a.StartedAt = ts
+		if len(line) > 0 {
+			if r, ok := decodeRecord(line); ok {
+				sawAny = true
+				applyRecord(a, r, perModel, seenCalls, seenTools, &lastCall, &calls, &tools)
 			}
-			if ts.After(a.LastActivityAt) {
-				a.LastActivityAt = ts
+			// A record that fails to decode is normal on a live session: the
+			// agent may be mid-write on the final line.
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				// A genuine read error means we saw only part of the file.
+				a.Incomplete = true
 			}
-		}
-		if r.CWD != "" {
-			a.CWD = r.CWD
-		}
-		if r.GitBranch != "" && r.GitBranch != "HEAD" {
-			a.GitBranch = r.GitBranch
-		}
-		if r.AITitle != "" {
-			a.Title = r.AITitle
-		} else if a.Title == "" && r.LastPrompt != "" {
-			a.Title = firstLine(r.LastPrompt)
-		}
-		if r.Entrypoint != "" {
-			a.Origin = mapOrigin(r.Entrypoint, r.Origin)
-		}
-		if r.ToolUseID != "" || len(r.ToolResult) > 0 {
-			tools++
-		}
-
-		if r.Message != nil {
-			if r.Message.Model != "" {
-				a.Model = r.Message.Model
-			}
-			if u := r.Message.Usage; u != nil {
-				total.InputTokens += u.InputTokens
-				total.OutputTokens += u.OutputTokens
-				total.CacheReadTokens += u.CacheReadTokens
-				total.CacheCreationTokens += u.CacheCreationTokens
-				copied := *u
-				lastCall = &copied
-				calls++
-			}
+			break
 		}
 	}
 	if !sawAny {
@@ -271,12 +239,23 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 		a.LastActivityAt = info.ModTime()
 	}
 
-	a.InputTokens = total.InputTokens
-	a.OutputTokens = total.OutputTokens
-	a.CacheReadTokens = total.CacheReadTokens
-	a.CacheWriteTokens = total.CacheCreationTokens
+	// Sum the per-model buckets into the session totals.
+	for _, u := range perModel {
+		a.InputTokens += u.InputTokens
+		a.OutputTokens += u.OutputTokens
+		a.CacheReadTokens += u.CacheReadTokens
+		a.CacheWriteTokens += u.CacheCreationTokens
+	}
 	a.APICallCount = calls
 	a.ToolCallCount = tools
+
+	// The project slug flattens path separators to dashes and is therefore
+	// not reversible; cwd is recorded in the transcript itself and is exact.
+	if a.CWD != "" {
+		a.Instance = filepath.Base(a.CWD)
+	} else {
+		a.Instance = projectLabel(filepath.Dir(path))
+	}
 
 	// The last call's prefix is a real measurement of context fill, not an
 	// approximation — flag it as such so the UI need not hedge.
@@ -288,27 +267,24 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 		a.CtxWindow = w
 	}
 
-	// No cost is recorded anywhere, so derive it — and say so.
-	cost, known := pricing.Estimate(a.Model, pricing.Usage{
-		Input:      total.InputTokens,
-		Output:     total.OutputTokens,
-		CacheRead:  total.CacheReadTokens,
-		CacheWrite: total.CacheCreationTokens,
-	}, now)
-	if known {
-		a.CostUSD, a.CostSource = cost, agent.CostEstimated
-	} else {
-		a.CostSource = agent.CostUnknown
-	}
+	// Price each model's own tokens at its own rates. A session that switched
+	// models — 10% of live transcripts do — would otherwise be billed entirely
+	// at whichever model happened to write last, in either direction.
+	a.CostUSD, a.CostSource = pricePerModel(perModel, now)
 
-	// Infer an end rather than reporting a long-finished run as wedged.
-	// EndReason records that this is inferred, not observed, so the
-	// distinction survives into --json.
+	// Only infer an end for sessions a human was driving: they stop because
+	// someone walked away, and hiding them is what keeps the table readable.
+	//
+	// For an unattended session there is no such inference to make. Nothing in
+	// a transcript distinguishes "finished cleanly" from "wedged" — there is no
+	// terminal stop marker — so calling it DONE would silently retire exactly
+	// the alert this tool exists to raise. Left live, it stays STUCK and
+	// visible; use --lookback to bound how far back sessions are considered.
 	assumeEnded := p.AssumeEndedAfter
 	if assumeEnded <= 0 {
 		assumeEnded = DefaultAssumeEndedAfter
 	}
-	if now.Sub(a.LastActivityAt) > assumeEnded {
+	if a.IsInteractive() && now.Sub(a.LastActivityAt) > assumeEnded {
 		a.EndedAt = a.LastActivityAt
 		a.EndReason = "inferred: no transcript activity"
 	}
@@ -317,6 +293,134 @@ func (p *Provider) parse(path string, now time.Time) *agent.Agent {
 		a.Title = a.SessionID
 	}
 	return a
+}
+
+// applyRecord folds one decoded transcript record into the agent under
+// construction.
+func applyRecord(
+	a *agent.Agent, r record,
+	perModel map[string]*usageField,
+	seenCalls, seenTools map[string]bool,
+	lastCall **usageField, calls, tools *int64,
+) {
+	if ts := parseTime(r.Timestamp); !ts.IsZero() {
+		if a.StartedAt.IsZero() || ts.Before(a.StartedAt) {
+			a.StartedAt = ts
+		}
+		if ts.After(a.LastActivityAt) {
+			a.LastActivityAt = ts
+		}
+	}
+	if r.CWD != "" {
+		a.CWD = r.CWD
+	}
+	if r.GitBranch != "" && r.GitBranch != "HEAD" {
+		a.GitBranch = r.GitBranch
+	}
+	if r.AITitle != "" {
+		a.Title = r.AITitle
+	} else if a.Title == "" && r.LastPrompt != "" {
+		a.Title = jsonl.FirstLine(r.LastPrompt)
+	}
+	if r.Entrypoint != "" {
+		a.Origin = mapOrigin(r.Entrypoint, r.Origin)
+	}
+
+	// Tool lines repeat per content block too, so count distinct tool uses.
+	if r.ToolUseID != "" {
+		if !seenTools[r.ToolUseID] {
+			seenTools[r.ToolUseID] = true
+			*tools++
+		}
+	} else if len(r.ToolResult) > 0 {
+		*tools++
+	}
+
+	if r.Message == nil {
+		return
+	}
+	// A synthetic record is Claude Code's own bookkeeping; letting it win the
+	// "current model" race leaves the session unpriced and its window unknown.
+	if r.Message.Model != "" && r.Message.Model != syntheticModel {
+		a.Model = r.Message.Model
+	}
+
+	u := r.Message.Usage
+	if u == nil {
+		return
+	}
+	// One API call is written as several lines, one per content block, each
+	// repeating an identical usage object. Counting them all inflates tokens,
+	// cost and every derived rate by roughly the number of blocks.
+	key := r.Message.ID + "\x00" + r.RequestID
+	if r.Message.ID == "" && r.RequestID == "" {
+		// No identity to dedupe on: count it, since dropping it would
+		// under-report. Records like this predate the id fields.
+		key = ""
+	} else {
+		if seenCalls[key] {
+			return
+		}
+		seenCalls[key] = true
+	}
+
+	model := r.Message.Model
+	if model == "" {
+		model = a.Model
+	}
+	bucket := perModel[model]
+	if bucket == nil {
+		bucket = &usageField{}
+		perModel[model] = bucket
+	}
+	bucket.InputTokens += u.InputTokens
+	bucket.OutputTokens += u.OutputTokens
+	bucket.CacheReadTokens += u.CacheReadTokens
+	bucket.CacheCreationTokens += u.CacheCreationTokens
+
+	copied := *u
+	*lastCall = &copied
+	*calls++
+}
+
+// pricePerModel totals a session's cost from per-model usage.
+//
+// If any model that actually consumed tokens has no rates, the total cannot be
+// stated, so the whole session reports unknown rather than a figure that is
+// silently missing a component.
+func pricePerModel(perModel map[string]*usageField, now time.Time) (float64, agent.CostSource) {
+	var total float64
+	priced := false
+	for model, u := range perModel {
+		usage := pricing.Usage{
+			Input:      u.InputTokens,
+			Output:     u.OutputTokens,
+			CacheRead:  u.CacheReadTokens,
+			CacheWrite: u.CacheCreationTokens,
+		}
+		if usage == (pricing.Usage{}) {
+			continue // a model that burned nothing needs no rates
+		}
+		cost, known := pricing.Estimate(model, usage, now)
+		if !known {
+			return 0, agent.CostUnknown
+		}
+		total += cost
+		priced = true
+	}
+	if !priced {
+		return 0, agent.CostUnknown
+	}
+	return total, agent.CostEstimated
+}
+
+// decodeRecord parses one transcript line, reporting whether it was usable.
+func decodeRecord(line []byte) (record, bool) {
+	var r record
+	if err := json.Unmarshal(line, &r); err != nil {
+		return r, false
+	}
+	return r, true
 }
 
 // mapOrigin translates Claude Code's entrypoint and origin fields onto the
@@ -365,11 +469,4 @@ func parseTime(s string) time.Time {
 		return time.Time{}
 	}
 	return t
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
 }

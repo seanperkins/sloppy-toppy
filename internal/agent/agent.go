@@ -141,6 +141,13 @@ type Agent struct {
 	ToolCallCount  int64
 	OwnerPID       int
 
+	// Incomplete means part of this session's source could not be read, so
+	// the token and cost figures are a floor rather than a total. A silently
+	// truncated read is worse than no reading at all in a spend monitor: it
+	// looks authoritative while under-reporting exactly the runaway usage the
+	// tool exists to catch.
+	Incomplete bool
+
 	// Computed by the monitor.
 	TokRate     float64 // tokens/sec, EMA of poll diffs
 	CostRate    float64 // $/hour, EMA of poll diffs
@@ -307,9 +314,16 @@ func FmtTokens(n int64) string {
 }
 
 // FmtUSD renders a dollar amount, keeping sub-cent costs legible.
+//
+// Negatives are rendered, not clamped: an overdrawn OpenRouter balance is a
+// real value, and showing "-12.00" as "0.00" would hide exactly the state a
+// spend monitor exists to surface.
 func FmtUSD(x float64) string {
+	if x < 0 {
+		return "-" + FmtUSD(-x)
+	}
 	switch {
-	case x <= 0:
+	case x == 0:
 		return "0.00"
 	case x < 0.01:
 		return fmt.Sprintf("%.5f", x)
@@ -333,12 +347,105 @@ func FmtCostRate(usdPerHour float64) string {
 	return fmt.Sprintf("%.2f", usdPerHour)
 }
 
+// Sanitize strips terminal control sequences from a provider-supplied string.
+//
+// Every displayed field here originates in a file written by another program:
+// a session title is a user prompt, an action description is a runtime's own
+// text. Rendering those to a terminal verbatim lets whoever influenced them
+// drive the terminal — CSI can erase and repaint a row (showing STUCK as
+// ACTIVE, or a $40/hr burn as $0.02), and OSC 52 writes the system clipboard.
+//
+// This runs at the render boundary rather than in each adapter, so a new
+// adapter cannot forget it. JSON output does not need it: encoding/json
+// escapes C0 control bytes already.
+func Sanitize(s string) string {
+	if s == "" {
+		return s
+	}
+	// Fast path: the overwhelming majority of strings are already clean.
+	if strings.IndexFunc(s, isControl) < 0 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		// Drop an entire escape sequence, not just the ESC byte — leaving the
+		// parameter bytes behind would spray "[2K" into the table.
+		if r == 0x1b {
+			i = skipEscapeSequence(runes, i)
+			continue
+		}
+		if isControl(r) {
+			// Whitespace controls become a space so words do not run together;
+			// everything else is dropped outright.
+			if r == '\t' || r == '\n' || r == '\r' {
+				b.WriteByte(' ')
+			}
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// isControl reports whether r is a C0 or C1 control character, or DEL.
+func isControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+// skipEscapeSequence returns the index of the last rune of the escape
+// sequence starting at i, so the caller's loop increment lands past it.
+func skipEscapeSequence(r []rune, i int) int {
+	// i points at ESC. Nothing follows it: consume just the ESC.
+	if i+1 >= len(r) {
+		return i
+	}
+	switch r[i+1] {
+	case '[': // CSI: parameters/intermediates, then a final byte in @..~
+		j := i + 2
+		for j < len(r) && r[j] >= 0x20 && r[j] <= 0x3f {
+			j++
+		}
+		for j < len(r) && r[j] >= 0x20 && r[j] <= 0x2f {
+			j++
+		}
+		if j < len(r) {
+			j++ // the final byte
+		}
+		return j - 1
+	case ']', 'P', 'X', '^', '_': // OSC/DCS/SOS/PM/APC: run to ST or BEL
+		j := i + 2
+		for j < len(r) {
+			if r[j] == 0x07 { // BEL terminator
+				return j
+			}
+			if r[j] == 0x1b && j+1 < len(r) && r[j+1] == '\\' { // ESC \ (ST)
+				return j + 1
+			}
+			j++
+		}
+		return len(r) - 1 // unterminated: swallow the rest
+	default:
+		// Two-byte escape (e.g. ESC c full reset).
+		return i + 1
+	}
+}
+
 // Truncate shortens s to at most n display characters, appending an ellipsis
 // when it had to cut. Operates on runes so multi-byte titles are not split.
+//
+// It also sanitizes: truncation is the last thing every renderer does to a
+// provider string, which makes it the one chokepoint neither UI can bypass.
+// Sanitizing before measuring also keeps the width calculation honest — an
+// escape sequence occupies runes but no columns.
 func Truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
+	s = Sanitize(s)
 	r := []rune(s)
 	if len(r) <= n {
 		return s

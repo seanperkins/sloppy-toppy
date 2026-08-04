@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -138,7 +139,10 @@ func LoadOverrides(path string) error {
 		return err
 	}
 	// Fill in cache multipliers the user omitted, so a minimal override file
-	// listing only input/output prices still prices cached tokens sanely.
+	// listing only input/output prices still prices cached tokens sanely, and
+	// normalize the keys so matching does not silently depend on the casing
+	// the user happened to type.
+	loaded := make(map[string]Rates, len(parsed))
 	for name, r := range parsed {
 		if r.CacheReadMult == 0 {
 			r.CacheReadMult = cacheReadMult
@@ -146,19 +150,28 @@ func LoadOverrides(path string) error {
 		if r.CacheWriteMult == 0 {
 			r.CacheWriteMult = cacheWriteMult
 		}
-		parsed[name] = r
+		loaded[normalize(name)] = r
 	}
-	overrides = parsed
+	overrides = loaded
 	return nil
 }
+
+// dateSuffix matches a trailing snapshot date such as "-20251001".
+//
+// Anchored on exactly eight digits at the end so it cannot eat the version
+// segments of an id like claude-haiku-4-5.
+var dateSuffix = regexp.MustCompile(`-\d{8}$`)
 
 // normalize maps a provider-decorated model string onto a table key.
 //
 // It strips the vendor prefix Bedrock and OpenRouter-style IDs carry
 // ("anthropic.claude-opus-5", "anthropic/claude-opus-5"), the context-window
-// suffix Claude Code appends ("claude-opus-5[1m]"), and any date snapshot
-// suffix. It deliberately does NOT strip "-fast", which selects real premium
-// pricing and is handled separately.
+// suffix Claude Code appends ("claude-opus-5[1m]"), and a trailing date
+// snapshot ("claude-haiku-4-5-20251001" — which appears in live transcripts
+// and previously missed the table entirely, leaving the session unpriced).
+//
+// It deliberately does NOT strip "-fast", which selects real premium pricing
+// and is handled separately.
 func normalize(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	if i := strings.LastIndexAny(m, "/"); i >= 0 {
@@ -168,18 +181,16 @@ func normalize(model string) string {
 	if i := strings.Index(m, "["); i >= 0 {
 		m = m[:i]
 	}
-	return m
+	return dateSuffix.ReplaceAllString(m, "")
 }
 
 // Lookup returns the rates for a model and whether any were found.
 func Lookup(model string, now time.Time) (Rates, bool) {
 	m := normalize(model)
 
-	// User overrides win outright, including over promotional pricing.
+	// User overrides win outright, including over promotional pricing. Keys
+	// were normalized at load, so this single lookup is case-insensitive.
 	if r, ok := overrides[m]; ok {
-		return r, true
-	}
-	if r, ok := overrides[model]; ok {
 		return r, true
 	}
 

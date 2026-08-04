@@ -5,6 +5,11 @@ project_name: sloppy-toppy
 before:
   hooks:
     - go mod tidy
+    # Nothing else checked formatting, so an unformatted file shipped.
+    # `gofmt -l` prints offenders and exits 0, so the output has to be turned
+    # into the failure.
+    - sh -c 'test -z "$(gofmt -l .)" || { echo "unformatted:"; gofmt -l .; exit 1; }'
+    - go vet ./...
     - go test ./...
 
 builds:
@@ -27,8 +32,19 @@ builds:
 archives:
   - id: default
     formats: [tar.gz]
+    # Named to match what `uname -s` / `uname -m` produce, so the documented
+    # one-line install can be pasted verbatim. The previous template used
+    # lowercase os, Go's arch spelling, and a version segment, none of which a
+    # `latest/download/` URL built from uname can supply — every combination
+    # 404'd. Keep this in lockstep with the README install command.
     name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+      {{ .ProjectName }}_
+      {{- if eq .Os "darwin" }}Darwin
+      {{- else if eq .Os "linux" }}Linux
+      {{- else }}{{ title .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- else }}{{ .Arch }}{{ end }}
     files:
       - README.md
       - LICENSE

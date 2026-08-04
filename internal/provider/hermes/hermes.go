@@ -52,9 +52,6 @@ func New(base string) *Provider {
 	return &Provider{Base: base, DefaultCtx: DefaultCtxWindow}
 }
 
-// Name implements provider.Provider.
-func (p *Provider) Name() string { return "hermes" }
-
 // Install is one discovered Hermes state directory with a live gateway.
 type Install struct {
 	Home       string // profile dir, or the base for the default install
@@ -67,9 +64,18 @@ type Install struct {
 type pidFile struct {
 	PID  int    `json:"pid"`
 	Kind string `json:"kind"`
-	// StartTime is the gateway's process start time. Comparing it guards
-	// against PID reuse: a recycled PID belonging to an unrelated process
-	// would otherwise read as a live gateway.
+	// StartTime is the gateway's process start time as Hermes recorded it.
+	//
+	// It is deliberately NOT used as a PID-reuse guard. Doing that correctly
+	// needs the *live* process's start time, which has no portable Go API —
+	// and the payoff would be small: signal 0 delivers nothing, so a recycled
+	// PID at worst keeps a dead install's sessions on the board rather than
+	// touching an unrelated process. Reaching even that requires write access
+	// to gateway.pid, at which point the attacker already owns the config.
+	//
+	// It is retained because it is the field a future guard would compare, and
+	// because decoding it documents the file's real shape. An earlier comment
+	// here asserted the guard existed; it never did.
 	StartTime int64  `json:"start_time"`
 	Home      string `json:"hermes_home"`
 }

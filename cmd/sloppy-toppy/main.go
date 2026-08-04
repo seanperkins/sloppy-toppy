@@ -43,6 +43,7 @@ type options struct {
 
 	providers   string
 	pricingFile string
+	noSpend     bool
 	showVersion bool
 
 	lookback    time.Duration
@@ -76,6 +77,8 @@ func run(argv []string) error {
 		"quiet time after which a session with no end marker is treated as finished")
 	fs.StringVar(&o.providers, "providers", "hermes,claude,codex", "comma-separated providers to poll")
 	fs.StringVar(&o.pricingFile, "pricing", "", "path to a pricing override file")
+	fs.BoolVar(&o.noSpend, "no-spend", false,
+		"do not contact remote spend APIs (OpenRouter) even if a key is set")
 	fs.BoolVar(&o.showVersion, "version", false, "print version and exit")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "sloppy-toppy — top for your AI agents\n\nUsage:\n  sloppy-toppy [flags]\n\nFlags:\n")
@@ -109,7 +112,12 @@ func run(argv []string) error {
 	if err != nil {
 		return err
 	}
-	spends := []provider.Spend{openrouter.New()}
+	// Reaching an external billing API is a network egress this binary should
+	// not perform just because some other tool happened to export the key.
+	var spends []provider.Spend
+	if !o.noSpend {
+		spends = append(spends, openrouter.New())
+	}
 
 	mon := monitor.New(monitor.Config{
 		ActiveIdle: o.activeIdle,
@@ -192,6 +200,12 @@ func runOnce(mon *monitor.Monitor, o options) error {
 	// or the table on stdout.
 	for _, err := range errs {
 		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+	// If every provider failed we have no view at all. Exiting 0 here would be
+	// indistinguishable from "no sessions running" to a cron job or a script,
+	// which is the one consumer that cannot see the warnings above.
+	if len(errs) > 0 && len(errs) == mon.ProviderCount() {
+		return fmt.Errorf("all %d providers failed", len(errs))
 	}
 	return nil
 }
