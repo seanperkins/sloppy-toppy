@@ -1,6 +1,7 @@
 # Build output
 /dist/
 /sloppy-toppy
+/bin/
 
 # Go
 *.test
