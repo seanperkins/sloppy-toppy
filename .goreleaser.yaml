@@ -1,0 +1,52 @@
+version: 2
+
+project_name: sloppy-toppy
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: sloppy-toppy
+    main: ./cmd/sloppy-toppy
+    binary: sloppy-toppy
+    env:
+      # CGO_ENABLED=0 is the whole point of using modernc.org/sqlite instead
+      # of a cgo binding: it keeps the binary fully static and lets every
+      # target below cross-compile from one machine, with no build matrix
+      # and no per-platform runner.
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto

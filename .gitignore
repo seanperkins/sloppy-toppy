@@ -1,0 +1,10 @@
+# Build output
+/dist/
+/sloppy-toppy
+
+# Go
+*.test
+*.out
+
+# Editor / OS
+.DS_Store
