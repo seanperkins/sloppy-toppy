@@ -103,7 +103,11 @@ jobs:
       # previously the first sign of that was a failed release.
       - uses: goreleaser/goreleaser-action@v7
         with:
-          version: latest
+          # Pinned to the major rather than "latest": the action warns that
+          # "latest" silently resolves to "~> v2" anyway, and a goreleaser
+          # major bump changes config semantics. Stating it means the bump is
+          # a deliberate edit rather than a surprise on an unrelated PR.
+          version: "~> v2"
           args: release --snapshot --clean --skip=publish
 
       - name: Binary runs and reports its version
