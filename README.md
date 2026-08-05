@@ -1,5 +1,7 @@
 # sloppy-toppy
 
+[![CI](https://github.com/seanperkins/sloppy-toppy/actions/workflows/ci.yml/badge.svg)](https://github.com/seanperkins/sloppy-toppy/actions/workflows/ci.yml)
+
 `top`, for the sloppy ones. A live terminal monitor for your AI agents —
 token burn rate, context fill, cost, and a stuck-agent heartbeat, across
 every agent runtime on the box.
@@ -151,18 +153,50 @@ than reporting a permanent error.
 ## Development
 
 ```sh
-go test ./...
-go test -race ./...
+make check   # gofmt, go vet, go test — the full release gate
+make race    # race detector (needs a C toolchain)
+make cover   # per-package + total coverage
+make help    # everything else
 ```
+
+`make check` is the single definition of "good to ship": CI runs it, the
+goreleaser before-hook runs it, and you run it locally. Add a gate to the
+Makefile, never to the workflow file — when the gates lived in two places,
+"passing" could mean two different things.
 
 Tests are fully hermetic: every adapter runs against synthetic fixtures in a
 temp directory, so the suite passes on any machine with no agent runtime
-installed.
+installed. Nothing in the suite touches the network — the OpenRouter tests
+stub the transport rather than reaching the real billing API.
+
+### What CI runs
+
+Every push to `main` and every pull request runs four jobs:
+
+| Job | What it protects |
+| --- | --- |
+| `check` on Linux **and** macOS | The gate itself. Both platforms, because path handling and `~` expansion differ. |
+| `race detector` | The poll loop hands provider results to the render loop across a goroutine boundary. |
+| `coverage` | Publishes a per-package table to the run summary; the profile is uploaded as an artifact. |
+| `cross-compile` | Builds all four release targets via `goreleaser --snapshot` and smoke-runs the binary. This catches a broken `.goreleaser.yaml` on a PR instead of at tag time. |
+
+### Testing conventions
+
+- **A fix lands with a test that fails without it.** Every cost-accounting bug
+  found so far was invisible to the suite until one was written — the
+  double-counting bug was actively *pinned in place* by a test asserting the
+  wrong total.
+- **Assert the property, not the current output.** Prefer "reasoning tokens are
+  excluded from output" over a hard-coded total that any pricing change
+  invalidates.
+- **Fixtures are synthetic and inline.** No real transcripts, which carry
+  prompt content, paths, and occasionally secrets.
 
 ## Building a release
 
 ```sh
-goreleaser release --clean
+make snapshot            # cross-compile all targets, publish nothing
+goreleaser release --clean   # tag must already be pushed
 ```
 
 All four targets — `darwin/arm64`, `darwin/amd64`, `linux/amd64`,

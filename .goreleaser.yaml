@@ -5,12 +5,11 @@ project_name: sloppy-toppy
 before:
   hooks:
     - go mod tidy
-    # Nothing else checked formatting, so an unformatted file shipped.
-    # `gofmt -l` prints offenders and exits 0, so the output has to be turned
-    # into the failure.
-    - sh -c 'test -z "$(gofmt -l .)" || { echo "unformatted:"; gofmt -l .; exit 1; }'
-    - go vet ./...
-    - go test ./...
+    # gofmt, vet and the suite. Deliberately delegated to the Makefile rather
+    # than restated here: when the gates lived in two files, "passing" could
+    # mean two different things, and the release path is the one place that
+    # must not be the weaker of the two.
+    - make check
 
 builds:
   - id: sloppy-toppy

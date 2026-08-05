@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a release be gated on a green run without waiting for a push.
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    # Both, because the transcript adapters touch paths and home-directory
+    # expansion, and the tool is installed on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Tracks the go directive rather than pinning a second copy of the
+          # version that then drifts from go.mod.
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt, vet and the suite. Defined in the Makefile so this workflow and
+      # the release hook cannot disagree about what "passing" means.
+      - run: make check
+
+      - name: go.mod is tidy
+        run: make tidy-check
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The poll loop hands provider results to the render loop across a
+      # goroutine boundary, which is exactly the bug class -race exists for.
+      # Kept out of `make check` so releasing never requires a C toolchain.
+      - run: make race
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # One run, then published to the run summary. Deliberately no grep in
+      # the pipeline: a grep that matches nothing exits 1 and would fail the
+      # step under the default `bash -e`.
+      - name: Coverage
+        run: |
+          make cover | tee cover.txt
+          {
+            echo '### Coverage'
+            echo '```'
+            cat cover.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # goreleaser reads tags to compute the version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Builds all four release targets from one runner and uploads nothing.
+      # This is what catches a .goreleaser.yaml that only breaks at tag time —
+      # previously the first sign of that was a failed release.
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: latest
+          args: release --snapshot --clean --skip=publish
+
+      - name: Binary runs and reports its version
+        run: |
+          set -euo pipefail
+          bin=$(find dist -type f -name sloppy-toppy -path '*linux_amd64*' | head -1)
+          test -n "$bin" || { echo "no linux/amd64 binary in dist"; exit 1; }
+          chmod +x "$bin"
+          "$bin" --version
+          # Empty bases are passed explicitly rather than relying on the
+          # runner's HOME being bare, so the check means the same thing on a
+          # laptop. With no sessions to read the tool must exit 0 and print
+          # nothing — not crash, and not hang waiting on a TTY.
+          empty=$(mktemp -d)
+          "$bin" --once --json --no-spend \
+            --hermes-base "$empty/h" --claude-base "$empty/c" --codex-base "$empty/x"
